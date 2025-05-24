@@ -8,7 +8,8 @@ import (
 	"log"
 	"net/http"
 	"time"
-
+    _ "golang.org/x/mobile/bind"
+	
 	"github.com/google/uuid"
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v3"
