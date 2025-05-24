@@ -5,46 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
-	"time"
-    _ "golang.org/x/mobile/bind"
-	
+	"sync"
+
 	"github.com/google/uuid"
-	"github.com/pion/rtp/codecs"
-	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/media"
-	"github.com/pion/webrtc/v3/pkg/media/samplebuilder"
-	"layeh.com/gopus"
 )
 
-const (
-	sampleRate   = 48000
-	channels     = 1
-	frameSize    = 960
-	opusBufSize  = 4000
-	syncRetryGap = time.Second
-)
-
-// HTTP helper
-func postJSON(url string, payload interface{}, out interface{}) error {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
-}
-
-// Matrix API paths
 const (
 	loginPath     = "/_matrix/client/r0/login"
 	sendEventPath = "/_matrix/client/r0/rooms/%s/send/%s/%s"
@@ -60,25 +26,20 @@ type loginResp struct {
 	AccessToken string `json:"access_token"`
 }
 
-// Client for Matrix call
-type Client struct {
-	homeserver  string
-	accessToken string
-	userID      string
+// MatrixClient - структура для управления signaling
+type MatrixClient struct {
+	mu          sync.Mutex
+	Homeserver  string
+	AccessToken string
+	UserID      string
+	RoomID      string
 
-	roomID string
-	pc     *webrtc.PeerConnection
-
-	currentCallID string
-	myPartyID     string
-
-	dataCh   chan []int16
-	decodeCh chan []int16
+	CurrentCallID string
+	MyPartyID     string
 }
 
-// NewClient logs in and prepares WebRTC PeerConnection
-func NewClient(homeserver, username, password, roomID string) (*Client, error) {
-	// Login
+// NewMatrixClient - логин в Matrix и создание клиента
+func NewMatrixClient(homeserver, username, password, roomID string) (*MatrixClient, error) {
 	url := homeserver + loginPath
 	req := loginReq{
 		Type:       "m.login.password",
@@ -90,139 +51,116 @@ func NewClient(homeserver, username, password, roomID string) (*Client, error) {
 		return nil, fmt.Errorf("login error: %w", err)
 	}
 
-	// Prepare PeerConnection
-	conf := webrtc.Configuration{
-		ICETransportPolicy: webrtc.ICETransportPolicyAll,
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-			{URLs: []string{"turn:webqalqan.com:3478"}, Username: "turnuser", Credential: "turnpass"},
-		},
+	client := &MatrixClient{
+		Homeserver:  homeserver,
+		AccessToken: resp.AccessToken,
+		UserID:      resp.UserID,
+		RoomID:      roomID,
+		MyPartyID:   uuid.NewString(),
 	}
-	pc, err := webrtc.NewPeerConnection(conf)
-	if err != nil {
-		return nil, fmt.Errorf("NewPeerConnection: %w", err)
-	}
-
-	c := &Client{
-		homeserver:    homeserver,
-		accessToken:   resp.AccessToken,
-		userID:        resp.UserID,
-		roomID:        roomID,
-		pc:            pc,
-		myPartyID:     uuid.NewString(),
-		dataCh:        make(chan []int16, 50),
-		decodeCh:      make(chan []int16, 50),
-	}
-
-	// ICE candidate handler
-	pc.OnICECandidate(func(cand *webrtc.ICECandidate) {
-		if cand == nil {
-			return
-		}
-		ice := cand.ToJSON()
-		payload := map[string]interface{}{
-			"call_id":   c.currentCallID,
-			"party_id":  c.myPartyID,
-			"version":   "1",
-			"candidates": []interface{}{map[string]interface{}{
-				"candidate":     ice.Candidate,
-				"sdpMid":        ice.SDPMid,
-				"sdpMLineIndex": ice.SDPMLineIndex,
-			}},
-		}
-		txn := uuid.NewString()
-		url := fmt.Sprintf(c.homeserver+sendEventPath, c.roomID, "m.call.candidates", txn)
-		if err := postJSON(url, payload, &map[string]interface{}{}); err != nil {
-			log.Println("Send candidates error:", err)
-		}
-	})
-
-	// Track handler
-	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		if track.Kind() != webrtc.RTPCodecTypeAudio {
-			return
-		}
-		go func() {
-			sb := samplebuilder.New(10, &codecs.OpusPacket{}, track.Codec().ClockRate)
-			dec, _ := gopus.NewDecoder(sampleRate, channels)
-			for {
-				pkt, _, err := track.ReadRTP()
-				if err != nil {
-					return
-				}
-				sb.Push(pkt)
-				for s := sb.Pop(); s != nil; s = sb.Pop() {
-					pcm, _ := dec.Decode(s.Data, frameSize, false)
-					select {
-					case c.decodeCh <- pcm:
-					default:
-					}
-				}
-			}
-		}()
-	})
-
-	return c, nil
+	return client, nil
 }
 
-// StartCall creates offer and sends invite
-func (c *Client) StartCall() error {
-	// Add audio track
-	enc, _ := gopus.NewEncoder(sampleRate, channels, gopus.Voip)
-	sendTrack, _ := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: sampleRate, Channels: channels},
-		"matrix-send", "audio",
-	)
-	c.pc.AddTrack(sendTrack)
-
-	// Connection state
-	c.pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		if state == webrtc.PeerConnectionStateConnected {
-			go func() {
-				for pcm := range c.dataCh {
-					data, _ := enc.Encode(pcm, frameSize, opusBufSize)
-					sendTrack.WriteSample(media.Sample{Data: data, Duration: 20 * time.Millisecond})
-				}
-			}()
-		}
-	})
-
-	// Sync placeholder: implement your own sync if needed
-
-	// Create offer
-	off, _ := c.pc.CreateOffer(nil)
-	c.pc.SetLocalDescription(off)
-	<-webrtc.GatheringCompletePromise(c.pc)
-	c.currentCallID = fmt.Sprintf("call-%d", time.Now().Unix())
-	invite := map[string]interface{}{ "call_id": c.currentCallID, "party_id": c.myPartyID, "lifetime": 60000, "offer": map[string]interface{}{"type": "offer", "sdp": off.SDP}, "version": "1" }
+// SendCallInvite - отправить приглашение на звонок (offer)
+// sdpOffer - строка SDP, которую сформирует Android
+func (c *MatrixClient) SendCallInvite(sdpOffer string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.CurrentCallID = uuid.NewString()
+	invite := map[string]interface{}{
+		"call_id":  c.CurrentCallID,
+		"party_id": c.MyPartyID,
+		"lifetime": 120000,
+		"offer":    map[string]interface{}{"type": "offer", "sdp": sdpOffer},
+		"version":  "1",
+	}
 	txn := uuid.NewString()
-	url := fmt.Sprintf(c.homeserver+sendEventPath, c.roomID, "m.call.invite", txn)
+	url := fmt.Sprintf(c.Homeserver+sendEventPath, c.RoomID, "m.call.invite", txn)
 	if err := postJSON(url, invite, &map[string]interface{}{}); err != nil {
+		return "", err
+	}
+	return c.CurrentCallID, nil
+}
+
+// SendCallAnswer - отправить ответ (answer)
+// sdpAnswer - строка SDP, которую сформирует Android
+func (c *MatrixClient) SendCallAnswer(sdpAnswer string, callID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if callID != "" {
+		c.CurrentCallID = callID
+	}
+	answer := map[string]interface{}{
+		"call_id":  c.CurrentCallID,
+		"party_id": c.MyPartyID,
+		"answer":   map[string]interface{}{"type": "answer", "sdp": sdpAnswer},
+		"version":  "1",
+	}
+	txn := uuid.NewString()
+	url := fmt.Sprintf(c.Homeserver+sendEventPath, c.RoomID, "m.call.answer", txn)
+	return postJSON(url, answer, &map[string]interface{}{})
+}
+
+// SendCandidates - отправить ICE-кандидаты (candidates - массив словарей с candidate, sdpMid, sdpMLineIndex)
+func (c *MatrixClient) SendCandidates(candidates []map[string]interface{}, callID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if callID != "" {
+		c.CurrentCallID = callID
+	}
+	payload := map[string]interface{}{
+		"call_id":    c.CurrentCallID,
+		"party_id":   c.MyPartyID,
+		"version":    "1",
+		"candidates": candidates,
+	}
+	txn := uuid.NewString()
+	url := fmt.Sprintf(c.Homeserver+sendEventPath, c.RoomID, "m.call.candidates", txn)
+	return postJSON(url, payload, &map[string]interface{}{})
+}
+
+// Вспомогательная функция POST
+func postJSON(url string, payload interface{}, out interface{}) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
 		return err
+	}
+	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
 	}
 	return nil
 }
 
-// SendAudio queues PCM bytes for sending
-func (c *Client) SendAudio(data []byte) {
-	n := len(data)/2
-	samples := make([]int16, n)
-	for i := 0; i < n; i++ {
-		samples[i] = int16(data[2*i]) | int16(data[2*i+1])<<8
-	}
-	select {
-	case c.dataCh <- samples:
-	default:
-	}
+// GetUserID - получить user_id после логина
+func (c *MatrixClient) GetUserID() string {
+	return c.UserID
 }
 
-// ReceiveAudio returns next PCM frame
-func (c *Client) ReceiveAudio() []byte {
-	pcm := <-c.decodeCh
-	out := make([]byte, len(pcm)*2)
-	for i, v := range pcm {
-		out[2*i] = byte(v)
-		out[2*i+1] = byte(v >> 8)
-	}
-	return out
+// GetAccessToken - получить access_token после логина
+func (c *MatrixClient) GetAccessToken() string {
+	return c.AccessToken
+}
+
+// GetPartyID - получить party_id (уникальный для этого клиента)
+func (c *MatrixClient) GetPartyID() string {
+	return c.MyPartyID
+}
+
+// GetCallID - получить последний call_id (или текущий)
+func (c *MatrixClient) GetCallID() string {
+	return c.CurrentCallID
 }
