@@ -1,0 +1,20 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "gomobile bind",
+        "type": "shell",
+        "command": "gomobile bind -target=android -o matrixdll.aar github.com/tessayKZ/matrixdll",
+        "group": {
+          "kind": "build",
+          "isDefault": true
+        },
+        "presentation": {
+          "reveal": "always",
+          "panel": "shared"
+        },
+        "problemMatcher": []
+      }
+    ]
+  }
+  
